@@ -1,30 +1,43 @@
 """One-time cleanup of the miss-log sheet: convert UTC ISO timestamps to
 Eastern datetimes and resolve Slack channel/user IDs to names.
 
-Idempotent: rows already converted (or otherwise unparseable) are left as-is.
+Idempotent and safe to re-run: timestamps and ID resolution are handled
+independently, so if the Slack name scopes (users:read / channels:read)
+aren't granted yet, a later re-run still upgrades the remaining raw IDs
+without touching already-converted timestamps.
+
 Needs the same env vars as the bot: SLACK_BOT_TOKEN, GOOGLE_SERVICE_ACCOUNT_JSON
 (and MISS_LOG_SHEET_ID if not using the default).
 
 Usage: python backfill_miss_log.py
 """
+import re
 from datetime import datetime
 
 from healthie_help_bot import (
     EASTERN, MISS_LOG_HEADER, _sheet, _sheet_text, channel_name, user_name,
 )
 
+CHANNEL_ID_RE = re.compile(r"^[CGD][A-Z0-9]{7,}$")
+USER_ID_RE = re.compile(r"^[UW][A-Z0-9]{7,}$")
 
-def convert_row(row: list[str]) -> list[str]:
-    ts, channel, user, question, reason = (row + [""] * 5)[:5]
+
+def convert_ts(ts: str) -> str:
     try:
         dt = datetime.fromisoformat(ts)
     except ValueError:
-        return row  # already converted or not a data row
+        return ts  # already converted or not a data row
     if dt.tzinfo is None:
-        return row
-    return [dt.astimezone(EASTERN).strftime("%Y-%m-%d %H:%M:%S"),
-            channel_name(channel), user_name(user), _sheet_text(question),
-            reason] + row[5:]  # preserve any feedback already entered
+        return ts
+    return dt.astimezone(EASTERN).strftime("%Y-%m-%d %H:%M:%S")
+
+
+def convert_row(row: list[str]) -> list[str]:
+    ts, channel, user, question, reason = (row + [""] * 5)[:5]
+    return [convert_ts(ts),
+            channel_name(channel) if CHANNEL_ID_RE.match(channel) else channel,
+            user_name(user) if USER_ID_RE.match(user) else user,
+            _sheet_text(question), reason] + row[5:]  # keep feedback etc.
 
 
 def main():
