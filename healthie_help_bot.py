@@ -372,8 +372,10 @@ def handle_message(event, say, client):
     print(f"EVENT ch={event.get('channel')} user={event.get('user')} "
           f"bot={event.get('bot_id')} subtype={event.get('subtype')} "
           f"text={event.get('text', '')[:60]!r}", flush=True)
-    # Spec step 2: human senders only; also ignore edits/joins/thread broadcasts
-    if event.get("bot_id") or event.get("subtype"):
+    # Spec step 2: human senders only; also ignore edits/joins/thread
+    # broadcasts. file_share is exempt: a message with an attachment is
+    # still a real question, and its text should be processed and logged.
+    if event.get("bot_id") or event.get("subtype") not in (None, "file_share"):
         return
     if event["channel"] in IGNORED_CHANNELS:
         return
