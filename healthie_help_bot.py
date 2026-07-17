@@ -2,6 +2,7 @@ import json
 import os
 import re
 from datetime import datetime, timezone
+from itertools import zip_longest
 from zoneinfo import ZoneInfo
 
 import gspread
@@ -12,8 +13,8 @@ from slack_bolt import App
 from slack_bolt.adapter.socket_mode import SocketModeHandler
 
 HELP_BASE = "https://help.gethealthie.com"
-MAX_ARTICLES = 3      # article bodies fetched and given to the gate/answer
-MAX_CANDIDATES = 10   # search hits considered by the title re-rank
+MAX_ARTICLES = 4      # article bodies fetched and given to the gate/answer
+MAX_CANDIDATES = 15   # search hits considered by the title re-rank
 ANSWER_MODEL = "claude-sonnet-4-6"
 GATE_MODEL = "claude-haiku-4-5-20251001"   # cheap yes/no gate
 WATCHED_CHANNELS = set(
@@ -130,14 +131,21 @@ def user_name(user_id: str) -> str:
 QUERY_PROMPT = """You turn a customer support message into search queries for a
 help center search engine that matches keywords literally (filler words hurt it).
 
-Extract 1-3 short queries, 1-4 words each, focused on the product feature or
-noun being asked about. Drop greetings, politeness, and filler.
+Extract 2-3 short queries, 1-3 words each, approaching the question from
+complementary angles:
+- the product feature or noun being asked about
+- when the question concerns what a particular role (provider, client, admin,
+  team member) sees, receives, or can do: that role plus the general feature
+  category, e.g. "provider notifications", "client booking"
+Every extra word hurts: prefer the shortest generic noun phrase and avoid
+verbs and qualifiers — "provider notifications" finds what "disable provider
+appointment reminders" buries. Drop greetings, politeness, and filler.
 Reply with one query per line and nothing else."""
 
 RERANK_PROMPT = """You pick the help center articles most likely to answer a
 customer support question, judging only by article titles.
 
-From the numbered list, reply with the numbers of up to 3 titles most relevant
+From the numbered list, reply with the numbers of up to 4 titles most relevant
 to the question, most relevant first, comma-separated (e.g. "4, 1"). Reply with
 numbers only."""
 
@@ -233,19 +241,20 @@ def rerank(question: str, candidates: list[dict]) -> list[dict]:
 
 
 def search_articles(question: str) -> list[str]:
-    """Search once per extracted keyword query; merge, dedupe, cap at
-    MAX_CANDIDATES, then re-rank by title down to MAX_ARTICLES.
+    """Search once per extracted keyword query; interleave the result lists
+    round-robin (so every query contributes candidates, not just the first),
+    dedupe, cap at MAX_CANDIDATES, then re-rank by title down to MAX_ARTICLES.
     Falls back to the raw message if the keyword queries find nothing."""
-    hits = []
-    for q in extract_queries(question):
-        hits.extend(search_help_center(q))
-    if not hits:
-        hits = search_help_center(question)
+    per_query = [search_help_center(q) for q in extract_queries(question)]
+    per_query = [hits for hits in per_query if hits]
+    if not per_query:
+        per_query = [search_help_center(question)]
     seen, candidates = set(), []
-    for h in hits:
-        if h["url"] not in seen:
-            seen.add(h["url"])
-            candidates.append(h)
+    for tier in zip_longest(*per_query):
+        for h in tier:
+            if h and h["url"] not in seen:
+                seen.add(h["url"])
+                candidates.append(h)
     candidates = candidates[:MAX_CANDIDATES]
     if len(candidates) > MAX_ARTICLES:
         candidates = rerank(question, candidates)
