@@ -1,7 +1,9 @@
 import json
 import os
 import re
+import threading
 from datetime import datetime, timezone
+from http.server import BaseHTTPRequestHandler, HTTPServer
 from itertools import zip_longest
 from zoneinfo import ZoneInfo
 
@@ -499,6 +501,46 @@ def handle_message(event, say, client):
             say(text=ERROR_REPLY, thread_ts=reply_ts)
 
 
+_socket_handler = None  # set in __main__; read by the health check
+
+
+class _HealthHandler(BaseHTTPRequestHandler):
+    """200 only while the Socket Mode websocket is actually connected, so a
+    dropped connection looks like a failing container rather than a quiet
+    channel. Any other path is 404."""
+
+    def do_GET(self):
+        if self.path.split("?")[0] not in ("/", "/health"):
+            self.send_response(404)
+            self.end_headers()
+            return
+        connected = bool(_socket_handler and _socket_handler.client.is_connected())
+        body = b"ok" if connected else b"socket mode disconnected"
+        self.send_response(200 if connected else 503)
+        self.send_header("Content-Type", "text/plain; charset=utf-8")
+        self.send_header("Content-Length", str(len(body)))
+        self.end_headers()
+        self.wfile.write(body)
+
+    def log_message(self, *args):
+        pass  # health checks poll constantly; keep them out of the service logs
+
+
+def start_health_server():
+    """Serve the health check on a daemon thread so it never blocks the bot."""
+    port = int(os.environ.get("PORT", "8080"))
+    try:
+        server = HTTPServer(("0.0.0.0", port), _HealthHandler)
+    except OSError as e:
+        print(f"health server failed to bind :{port} ({type(e).__name__}: {e}); "
+              "continuing without it", flush=True)
+        return
+    threading.Thread(target=server.serve_forever, daemon=True).start()
+    print(f"health server listening on :{port}", flush=True)
+
+
 if __name__ == "__main__":
     load_channel_modes()
-    SocketModeHandler(app, os.environ["SLACK_APP_TOKEN"]).start()
+    _socket_handler = SocketModeHandler(app, os.environ["SLACK_APP_TOKEN"])
+    start_health_server()
+    _socket_handler.start()
