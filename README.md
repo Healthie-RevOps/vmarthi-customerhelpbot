@@ -118,6 +118,9 @@ service's Variables tab:
 | `GOOGLE_SERVICE_ACCOUNT_JSON` | Service account key for the log Sheet |
 | `IGNORED_CHANNELS` | Optional comma-separated channel blocklist |
 | `WATCHED_CHANNELS` | Optional allowlist; unset = all joined channels |
+| `PORT` | Optional; health-check port (Railway sets this, default 8080) |
+
+**Health check:** the service serves `GET /health` on `$PORT` (default 8080), returning 200 only while the Socket Mode websocket is connected and 503 otherwise. Point Railway's health check at `/health` so a dropped connection restarts the container instead of looking like a quiet channel.
 
 ### 3. What Anthropic key/models it uses
 The bot authenticates with the `ANTHROPIC_API_KEY` set in Railway (manage or
