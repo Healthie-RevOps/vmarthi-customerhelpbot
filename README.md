@@ -120,7 +120,9 @@ service's Variables tab:
 | `WATCHED_CHANNELS` | Optional allowlist; unset = all joined channels |
 | `PORT` | Optional; health-check port (Railway sets this, default 8080) |
 
-**Health check:** the service serves `GET /health` on `$PORT` (default 8080), returning 200 only while the Socket Mode websocket is connected and 503 otherwise. Point Railway's health check at `/health` so a dropped connection restarts the container instead of looking like a quiet channel.
+**Health check:** the service serves `GET /health` on `$PORT` (default 8080), returning 200 only while the Socket Mode websocket is connected and 503 otherwise. `railway.json` points Railway's health check at `/health` with a 60s timeout (the health server binds before Socket Mode connects, so `/health` is 503 for the first few seconds of every boot).
+
+This gates **deploys**: a container that starts but cannot reach Slack will fail its health check and Railway keeps the previous deployment instead of promoting a dead one. It is not a continuous liveness probe — it will not catch a websocket that drops hours later. Nothing currently alerts on that; the `error:` rate in the miss log Sheet is the surface to watch. See the 2026-09-14 outage: the bot was hard-down for 7 days and was noticed only because someone asked about it in Slack.
 
 ### 3. What Anthropic key/models it uses
 The bot authenticates with the `ANTHROPIC_API_KEY` set in Railway (manage or
