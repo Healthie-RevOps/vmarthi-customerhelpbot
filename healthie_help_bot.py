@@ -2,6 +2,7 @@ import json
 import os
 import re
 import threading
+import traceback
 from datetime import datetime, timezone
 from http.server import BaseHTTPRequestHandler, HTTPServer
 from itertools import zip_longest
@@ -494,9 +495,13 @@ def handle_message(event, say, client):
         say(text=answer(question, docs), thread_ts=reply_ts)
         log_miss(event["channel"], event["user"], question, "answered")
     except Exception as e:
-        # Spec step 7 spirit: never post raw errors into customer channels
+        # Spec step 7 spirit: never post raw errors into customer channels.
+        # But DO make the failure findable: the class name alone left a
+        # week-long outage looking like a transient blip, because the
+        # traceback was never written anywhere.
+        traceback.print_exc()
         log_miss(event.get("channel", "?"), event.get("user", "?"),
-                 question, f"error:{type(e).__name__}")
+                 question, f"error:{type(e).__name__}: {e}")
         if mentioned:
             say(text=ERROR_REPLY, thread_ts=reply_ts)
 
