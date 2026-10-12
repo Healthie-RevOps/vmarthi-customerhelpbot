@@ -2,6 +2,7 @@ import json
 import os
 import re
 import threading
+import time
 import traceback
 from datetime import datetime, timezone
 from http.server import BaseHTTPRequestHandler, HTTPServer
@@ -43,15 +44,23 @@ STATUS_COMMANDS = {"status", "mode"}
 # Leading mention; group 2 is the mentioned user's ID (None for the literal)
 MENTION_RE = re.compile(r"^(<@([A-Z0-9]+)>|@healthie-help)\s*")
 
+# The existing Zapier Zap turns this reaction on a customer's message into a
+# Help Scout ticket from their email, so fallbacks just point them to it. The
+# customer must add it themselves: the Zap ticketing whatever the bot reacts to
+# would file tickets nobody asked for.
+TICKET_EMOJI = os.environ.get("TICKET_EMOJI", "envelope_with_arrow")
+
 NO_ANSWER_REPLY = (
-    "I do not have a help center article that directly answers this, "
-    "so I will leave it for the team rather than guess.\n"
+    "I do not have a help center article that directly answers this. "
+    f"React to your question with :{TICKET_EMOJI}: to send it to our support "
+    "team as a ticket.\n"
     "You can also browse the help center here:\n"
     "<https://help.gethealthie.com|Healthie Help Center>"
 )
 RELATED_REPLY = (
-    "I do not have a help center article that directly answers this, "
-    "so I will leave it for the team rather than guess.\n"
+    "I do not have a help center article that directly answers this. "
+    f"React to your question with :{TICKET_EMOJI}: to send it to our support "
+    "team as a ticket.\n"
     "These are the closest related articles. Please note they cover the "
     "same topic but do not directly answer your exact question:\n{links}"
 )
@@ -140,6 +149,11 @@ complementary angles:
 - when the question concerns what a particular role (provider, client, admin,
   team member) sees, receives, or can do: that role plus the general feature
   category, e.g. "provider notifications", "client booking"
+- when the question is about a field or question in a form, chart note, or
+  charting template (including whether it fills in data elsewhere): the
+  query "smart fields" — the help center's name for those fields — plus the
+  field named by the data it holds, e.g. "does the allergy question on my
+  intake form update the client's profile?" -> "smart fields", "allergy field"
 Every extra word hurts: prefer the shortest generic noun phrase and avoid
 verbs and qualifiers — "provider notifications" finds what "disable provider
 appointment reminders" buries. Drop greetings, politeness, and filler.
@@ -149,8 +163,11 @@ RERANK_PROMPT = """You pick the help center articles most likely to answer a
 customer support question, judging only by article titles.
 
 From the numbered list, reply with the numbers of up to 4 titles most relevant
-to the question, most relevant first, comma-separated (e.g. "4, 1"). Reply with
-numbers only."""
+to the question, most relevant first, comma-separated (e.g. "4, 1"). When the
+question asks about a field in a form, chart note, or charting template,
+include the Smart Fields title if listed (that article covers what those
+fields fill in elsewhere), even if other titles match the outcome more
+closely. Reply with numbers only."""
 
 GATE_PROMPT = """You are the relevance gate for a customer support bot. Work
 through these steps in order and reply with the first verdict that applies:
@@ -173,7 +190,10 @@ through these steps in order and reply with the first verdict that applies:
    is; the answer will state plainly what the docs do not cover. Never reply
    ANSWER when answering would require knowledge beyond what the articles
    state, multi-step speculation, or guessing at behavior the articles never
-   describe.
+   describe. When the question names a specific mechanism or source (a
+   particular field, setting, template, or screen), the articles must cover
+   that mechanism; articles reaching the same outcome a different way (e.g.
+   via appointment types instead of a charting field) are RELATED, not ANSWER.
 3. If the articles cover the same feature or topic as the question but do not
    directly answer the main thing being asked: reply RELATED. Questions asking
    whether a capability exists are RELATED only when the articles neither
@@ -201,6 +221,10 @@ Style rules:
   Appointment Type Settings lets these be set per appointment type") and cite
   each source article; never narrate your reasoning process. Beyond that, do
   not say yes — say the help docs do not specify.
+- When the question asks about a specific field, setting, or screen, answer
+  about that one. Mention other ways to reach the same result only after,
+  and only if the articles cover them. Never say something is the only way,
+  is required, or will not work unless an article says so.
 - Plain text with line breaks only. No markdown headers, no bold, no bullets
   unless listing 3+ items.
 - End with the help doc links that directly support your answer, each on its
@@ -470,15 +494,16 @@ def handle_message(event, say, client):
         urls = search_articles(question)
         articles = [a for a in (fetch_article(u) for u in urls) if a["text"]]
 
-        # Spec step 5: strict confidence gate — silence unless direct match,
-        # except when mentioned: then reply with related links (if the
-        # articles are at least on-topic) or a polite decline.
+        # Spec step 5: strict confidence gate. A direct match gets an answer;
+        # on-topic articles get surfaced as clearly-labelled related links;
+        # anything else stays silent unless mentioned, then a polite decline.
+        # Both fallbacks point to the Zapier reaction that files a ticket.
         if not articles:
             verdict, reason = "SKIP", "no_search_results"
         else:
             docs = build_docs(articles)
             verdict, reason = gate(question, docs)
-        if verdict == "RELATED" and mentioned:
+        if verdict == "RELATED":
             links = "\n".join(f"<{a['url']}|{a['title']}>" for a in articles)
             say(text=RELATED_REPLY.format(links=links), thread_ts=reply_ts)
             log_miss(event["channel"], event["user"], question,
@@ -508,18 +533,49 @@ def handle_message(event, say, client):
 
 _socket_handler = None  # set in __main__; read by the health check
 
+PONG_FRESH_SECONDS = 60     # Slack is pinged every 10s, so a pong is due often
+STALE_SOCKET_SECONDS = 300  # this long without one and the process exits
+
+
+def socket_alive() -> bool:
+    """True if Slack answered a ping recently. client.is_connected() only
+    checks that a socket object exists: during the Oct 8-12 outage it could
+    stay true while every send raised BrokenPipeError and no events arrived."""
+    client = _socket_handler.client if _socket_handler else None
+    session = getattr(client, "current_session", None)
+    pong = getattr(session, "last_ping_pong_time", None)
+    return pong is not None and time.time() - pong < PONG_FRESH_SECONDS
+
+
+def start_socket_watchdog():
+    """Exit the process once the socket has been dead for STALE_SOCKET_SECONDS.
+    Railway only checks /health at deploy time, and the Slack client's own
+    reconnect loop can fail forever, so a clean exit is what gets the
+    container restarted (restart policy in railway.json)."""
+    def watch():
+        last_alive = time.time()  # startup grace: one full window to connect
+        while True:
+            time.sleep(30)
+            if socket_alive():
+                last_alive = time.time()
+            elif time.time() - last_alive > STALE_SOCKET_SECONDS:
+                print(f"no pong from Slack in {STALE_SOCKET_SECONDS}s; exiting "
+                      "so the container restarts", flush=True)
+                os._exit(1)
+    threading.Thread(target=watch, daemon=True).start()
+
 
 class _HealthHandler(BaseHTTPRequestHandler):
-    """200 only while the Socket Mode websocket is actually connected, so a
-    dropped connection looks like a failing container rather than a quiet
-    channel. Any other path is 404."""
+    """200 only while Slack is answering pings, so a dropped connection looks
+    like a failing container rather than a quiet channel. Any other path is
+    404."""
 
     def do_GET(self):
         if self.path.split("?")[0] not in ("/", "/health"):
             self.send_response(404)
             self.end_headers()
             return
-        connected = bool(_socket_handler and _socket_handler.client.is_connected())
+        connected = socket_alive()
         body = b"ok" if connected else b"socket mode disconnected"
         self.send_response(200 if connected else 503)
         self.send_header("Content-Type", "text/plain; charset=utf-8")
@@ -548,4 +604,5 @@ if __name__ == "__main__":
     load_channel_modes()
     _socket_handler = SocketModeHandler(app, os.environ["SLACK_APP_TOKEN"])
     start_health_server()
+    start_socket_watchdog()
     _socket_handler.start()

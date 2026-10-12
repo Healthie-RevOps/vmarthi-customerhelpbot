@@ -2,7 +2,9 @@
 
 A Slack bot that answers customer questions using only content from the
 Healthie Help Center (help.gethealthie.com). If it cannot find a direct
-answer in the help docs, it stays silent rather than guessing.
+answer in the help docs, it never guesses: it shares the closest related
+articles (clearly labelled as not a direct answer) or stays silent, and
+offers to send the question to support.
 
 ---
 
@@ -18,8 +20,10 @@ the article text, and a strict relevance check runs before every reply.
 
 ### 2. How it gets triggered
 - **Automatic:** any human message of 10+ characters in a channel the bot is
-  in. The bot searches the Help Center, checks relevance, and replies only
-  if an article directly answers the question. Otherwise it stays silent.
+  in. The bot searches the Help Center, checks relevance, and replies with
+  an answer if an article directly answers the question, or with the closest
+  related articles if the docs are on-topic but not a direct match.
+  Otherwise it stays silent.
 - **Direct mention:** start a message with `@Healthie Help Bot` followed by an
   actual question and the bot always replies â€” with the answer if it has
   one; with links to the closest related articles (stating explicitly that
@@ -27,6 +31,12 @@ the article text, and a strict relevance check runs before every reply.
   but not a direct match; or a polite "I don't have an article for that"
   pointing to the Help Center. Mentions work even in muted channels. A bare
   mention (or mention with no real question) gets no response.
+- **Send to support:** every "no direct answer" reply tells the customer to
+  react to their question with :envelope_with_arrow: (override with the
+  `TICKET_EMOJI` env var). The bot does nothing with the reaction itself:
+  the existing Zapier Zap picks it up and files a Help Scout ticket from
+  the customer's email. The Zap must be watching the channel for this to
+  work.
 - It ignores messages from other bots, message edits, join/leave events,
   and channels listed in the `IGNORED_CHANNELS` env var.
 
@@ -51,8 +61,9 @@ Every channel has its own mode, toggled by anyone in the channel:
 ### 5. Why it's safe
 - **Strict answer gate:** a separate model call checks whether the fetched
   articles DIRECTLY answer the exact question. Related-but-not-exact matches
-  are skipped. Questions involving custom pricing, contracts, PHI, or
-  account-specific data are always skipped.
+  are never answered, only listed as links with an explicit note that they
+  do not answer the exact question. Questions involving custom pricing,
+  contracts, PHI, or account-specific data are always skipped.
 - **Grounded answers only:** the answer model is instructed to use ONLY the
   provided article text and never invent information; every answer links its
   sources so the reader can verify.
@@ -119,10 +130,11 @@ service's Variables tab:
 | `IGNORED_CHANNELS` | Optional comma-separated channel blocklist |
 | `WATCHED_CHANNELS` | Optional allowlist; unset = all joined channels |
 | `PORT` | Optional; health-check port (Railway sets this, default 8080) |
+| `TICKET_EMOJI` | Optional; Slack name of the reaction the Zapier ticket Zap watches (default `envelope_with_arrow`) |
 
-**Health check:** the service serves `GET /health` on `$PORT` (default 8080), returning 200 only while the Socket Mode websocket is connected and 503 otherwise. `railway.json` points Railway's health check at `/health` with a 60s timeout (the health server binds before Socket Mode connects, so `/health` is 503 for the first few seconds of every boot).
+**Health check:** the service serves `GET /health` on `$PORT` (default 8080), returning 200 only while Slack has answered a websocket ping in the last 60 seconds (pings go out every 10s) and 503 otherwise. `railway.json` points Railway's health check at `/health` with a 60s timeout (`/health` is 503 for the first few seconds of every boot, until the first pong). This gates **deploys** only: Railway does not poll it afterwards.
 
-This gates **deploys**: a container that starts but cannot reach Slack will fail its health check and Railway keeps the previous deployment instead of promoting a dead one. It is not a continuous liveness probe — it will not catch a websocket that drops hours later. Nothing currently alerts on that; the `error:` rate in the miss log Sheet is the surface to watch. See the 2026-09-14 outage: the bot was hard-down for 7 days and was noticed only because someone asked about it in Slack.
+**Self-restart on a dead socket:** a watchdog thread exits the process if Slack has not answered a ping for 5 minutes, and `railway.json` sets the restart policy to `ALWAYS`, so Railway brings up a fresh container. This exists because of two outages (2026-09-14, 7 days; 2026-10-08, 4 days) in which the Slack client's reconnect loop logged `BrokenPipeError` endlessly while the container stayed "up" and no events arrived. Pong freshness is the signal, not `client.is_connected()`, which only checks that a socket object exists and stayed true throughout. A restart shows in the logs as `no pong from Slack in 300s; exiting so the container restarts`.
 
 ### 3. What Anthropic key/models it uses
 The bot authenticates with the `ANTHROPIC_API_KEY` set in Railway (manage or
